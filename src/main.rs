@@ -1,11 +1,12 @@
 #![allow(dead_code)]
 use bitflags::bitflags;
+use clap::{Parser, Subcommand};
 use std::{
     collections::HashMap,
-    fs,
-    io::{Cursor, Error, ErrorKind},
+    fs::{self, File},
+    io::{Cursor, Error, ErrorKind, BufReader},
     ops::Deref,
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 mod deserialization;
@@ -15,10 +16,10 @@ mod display;
 use deserialization::Deserialize;
 use serialization::Serialize;
 
-#[derive(Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
+#[derive(Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Copy, serde::Deserialize, serde::Serialize)]
 struct CPIndex(u16);
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Deserialize, serde::Serialize)]
 enum ReferenceKind {
     GetField = 1,
     GetStatic = 2,
@@ -31,7 +32,7 @@ enum ReferenceKind {
     InvokeInterface = 9,
 }
 
-#[derive(Debug)]
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
 enum ConstantPoolEntry {
     Class {
         name_index: CPIndex,
@@ -73,7 +74,7 @@ enum ConstantPoolEntry {
     },
 }
 
-#[derive(Debug)]
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
 struct ConstantPool {
     // HashMap and not Vec, because ConstantPoolEntry's indices begin at 1, and some indices are
     // invalid (i.e with Double and Long constants).
@@ -81,6 +82,7 @@ struct ConstantPool {
 }
 
 bitflags! {
+    #[derive(serde::Deserialize, serde::Serialize)]
     struct AccessFlags: u16 {
         const PUBLIC       = 0x0001; // ---- ---- ---- ---1
         const PRIVATE      = 0x0002; // ---- ---- ---- --1-
@@ -103,7 +105,7 @@ bitflags! {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
 struct Field {
     access_flags: AccessFlags,
     name_index: CPIndex,
@@ -111,7 +113,7 @@ struct Field {
     attributes: Vec<Attribute>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
 struct Method {
     access_flags: AccessFlags,
     name_index: CPIndex,
@@ -119,7 +121,7 @@ struct Method {
     attributes: Vec<Attribute>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
 struct ExceptionTableEntry {
     start: u16,
     end: u16,
@@ -127,10 +129,10 @@ struct ExceptionTableEntry {
     catch_type: CPIndex,
 }
 
-#[derive(Debug)]
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
 struct CodeByte(u8);
 
-#[derive(Debug)]
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
 enum AttributeInfo {
     Any(Vec<u8>),
     ConstantValue {
@@ -149,13 +151,13 @@ enum AttributeInfo {
     },
 }
 
-#[derive(Debug)]
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
 struct Attribute {
     name_index: CPIndex,
     info: AttributeInfo,
 }
 
-#[derive(Debug)]
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
 struct JavaClass {
     magic_bytes: u32,
     minor_version: u16,
@@ -379,8 +381,47 @@ impl JavaClass {
     }
 }
 
+#[derive(Parser)]
+#[clap(author, version, about, long_about = None)]
+struct Args {
+    #[clap(subcommand)]
+    command: Command,
+}
+#[derive(Subcommand)]
+enum Command {
+    /// convert class file to json
+    Json {
+        /// path to the class
+        #[clap(parse(from_os_str))]
+        class: PathBuf,
+        /// path to the json
+        #[clap(parse(from_os_str))]
+        json: PathBuf
+    },
+    /// convert json file to class
+    Class {
+        /// path to the json
+        #[clap(parse(from_os_str))]
+        json: PathBuf,
+        /// path to the class
+        #[clap(parse(from_os_str))]
+        class: PathBuf
+    }
+}
+
 fn main() {
-    let class = JavaClass::from_file("./Main.class").unwrap();
-    class.print();
-    class.to_file("./NMain.class").unwrap();
+    let args = Args::parse();
+
+    match args.command {
+        Command::Json { class, json } => {
+            let cls = JavaClass::from_file(class).unwrap();
+            fs::write(json, serde_json::to_string_pretty(&cls).unwrap()).unwrap();
+        }
+        Command::Class { json, class } => {
+            let file = File::open(json).unwrap();
+            let reader = BufReader::new(file);
+            let cls: JavaClass = serde_json::from_reader(reader).unwrap();
+            cls.to_file(class).unwrap();
+        }
+    }
 }
