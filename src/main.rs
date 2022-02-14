@@ -1,5 +1,5 @@
 #![allow(dead_code)]
-use std::{fs, io::{Cursor, Error, ErrorKind}, collections::HashMap, ops::Deref, fmt::Display};
+use std::{fs, io::{Cursor, Error, ErrorKind}, collections::HashMap, ops::Deref, fmt::Display, path::Path};
 use bitflags::bitflags;
 use read::read_u8;
 
@@ -11,6 +11,12 @@ trait Deserialize {
 
 #[derive(Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
 struct CPIndex(u16);
+
+impl<'a> CPIndex {
+    fn display(&self, cp: &'a ConstantPool) -> DisplayCP<'a> {
+        DisplayCP(*self, cp)
+    }
+}
 
 impl Display for CPIndex {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -137,13 +143,16 @@ enum ConstantPoolEntry {
     },
 }
 
-impl ConstantPoolEntry {
+impl<'a> ConstantPoolEntry {
     // returns the 'size' of this entry, because some java is weird 
     fn size(&self) -> u16 {
         match self {
             ConstantPoolEntry::Long(_) | ConstantPoolEntry::Double(_) => 2u16,
             _ => 1u16
         }
+    }
+    fn display(&'a self, cp: &'a ConstantPool) -> DisplayConstantPoolEntry<'a> {
+        DisplayConstantPoolEntry(self, cp)
     }
 }
 
@@ -214,23 +223,23 @@ impl<'a> Display for DisplayConstantPoolEntry<'a> {
             ConstantPoolEntry::Double(d)
                 => write!(f, "(double {})", d),
             ConstantPoolEntry::Class { name_index }
-                => write!(f, "(class {})", DisplayCP(*name_index, self.1)),
+                => write!(f, "(class {})", name_index.display(self.1)),
             ConstantPoolEntry::String { string_index }
-                => write!(f, "(string {})", DisplayCP(*string_index, self.1)),
+                => write!(f, "(string {})", string_index.display(self.1)),
             ConstantPoolEntry::FieldRef { class_index, name_and_type_index }
-                => write!(f, "(fieldref {} {})", DisplayCP(*class_index, self.1), DisplayCP(*name_and_type_index, self.1)),
+                => write!(f, "(fieldref {} {})", class_index.display(self.1), name_and_type_index.display(self.1)),
             ConstantPoolEntry::MethodRef { class_index, name_and_type_index }
-                => write!(f, "(methodref {} {})", DisplayCP(*class_index, self.1), DisplayCP(*name_and_type_index, self.1)),
+                => write!(f, "(methodref {} {})", class_index.display(self.1), name_and_type_index.display(self.1)),
             ConstantPoolEntry::InterfaceMethodRef { class_index, name_and_type_index }
-                => write!(f, "(interfacemethodref {} {})", DisplayCP(*class_index, self.1), DisplayCP(*name_and_type_index, self.1)),
+                => write!(f, "(interfacemethodref {} {})", class_index.display(self.1), name_and_type_index.display(self.1)),
             ConstantPoolEntry::MethodType { descriptor_index }
-                => write!(f, "(methodtype {})", DisplayCP(*descriptor_index, self.1)),
+                => write!(f, "(methodtype {})", descriptor_index.display(self.1)),
             ConstantPoolEntry::NameAndType { name_index, descriptor_index }
-                => write!(f, "(name {} {})", DisplayCP(*name_index, self.1), DisplayCP(*descriptor_index, self.1)),
+                => write!(f, "(name {} {})", name_index.display(self.1), descriptor_index.display(self.1)),
             ConstantPoolEntry::MethodHandle { reference_kind, reference_index }
-                => write!(f, "(kind {} {})", reference_kind, DisplayCP(*reference_index, self.1)),
+                => write!(f, "(kind {} {})", reference_kind, reference_index.display(self.1)),
             ConstantPoolEntry::InvokeDynamic { bootstrap_method_attr_index, name_and_type_index }
-                => write!(f, "(invokedyn attr {} {})", bootstrap_method_attr_index, DisplayCP(*name_and_type_index, self.1)),
+                => write!(f, "(invokedyn attr {} {})", bootstrap_method_attr_index, name_and_type_index.display(self.1)),
         }
     }
 }
@@ -308,15 +317,19 @@ impl Deserialize for AccessFlags {
     }
 }
 
+fn deserialize_vec<T: Deserialize>(bytes: &mut Cursor<Vec<u8>>, count: usize) -> Result<Vec<T>, Error> {
+    let mut res = Vec::with_capacity(count);
+
+    for _ in 0..count {
+        res.push(T::deserialize(bytes)?);
+    }
+    Ok(res)
+}
+
 impl<T> Deserialize for Vec<T> where T: Deserialize {
     fn deserialize(bytes: &mut Cursor<Vec<u8>>) -> Result<Self, Error> {
         let count = read::read_u16(bytes)? as usize;
-        let mut res = Vec::with_capacity(count);
-
-        for _ in 0..count {
-            res.push(T::deserialize(bytes)?);
-        }
-        Ok(res)
+        deserialize_vec(bytes, count)
     }
 }
 
@@ -369,8 +382,64 @@ impl Deserialize for Method {
 }
 
 #[derive(Debug)]
+struct ExceptionTableEntry {
+    start: u16,
+    end: u16,
+    handler: u16,
+    catch_type: CPIndex
+}
+
+impl Deserialize for ExceptionTableEntry {
+    fn deserialize(bytes: &mut Cursor<Vec<u8>>) -> Result<Self, Error> {
+        Ok(Self {
+            start: read::read_u16(bytes)?,
+            end: read::read_u16(bytes)?,
+            handler: read::read_u16(bytes)?,
+            catch_type: CPIndex::deserialize(bytes)?,
+        })
+    }
+}
+
+#[derive(Debug)]
+struct CodeByte(u8);
+
+impl Deserialize for CodeByte {
+    fn deserialize(bytes: &mut Cursor<Vec<u8>>) -> Result<Self, Error> {
+        Ok(Self(read::read_u8(bytes)?))
+    }
+}
+
+#[derive(Debug)]
 enum AttributeInfo {
-    Any(Vec<u8>)
+    Any(Vec<u8>),
+    ConstantValue {
+        index: CPIndex
+    },
+    Code {
+        max_stack: u16,
+        max_locals: u16,
+        code: Vec<CodeByte>,
+        exception_table: Vec<ExceptionTableEntry>,
+        // nested attributes yay
+        attributes: Vec<Attribute>
+    },
+    Exceptions {
+        exception_index_table: Vec<CPIndex>,
+    }
+}
+
+impl Deserialize for AttributeInfo {
+    fn deserialize(bytes: &mut Cursor<Vec<u8>>) -> Result<Self, Error> {
+        let size = read::read_u32(bytes)?;
+        let buf = read::read_bytes(bytes, size as usize)?;
+        Ok(AttributeInfo::Any(buf))
+    }
+}
+
+impl Display for AttributeInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self)
+    }
 }
 
 #[derive(Debug)]
@@ -379,12 +448,60 @@ struct Attribute {
     info: AttributeInfo
 }
 
-impl Deserialize for AttributeInfo {
-    fn deserialize(bytes: &mut Cursor<Vec<u8>>) -> Result<Self, Error> {
-        let size = read::read_u32(bytes)?;
-        let buf = read::read_bytes(bytes, size as usize)?;
+impl<'a> Attribute {
+    fn display(&'a self, cp: &'a ConstantPool) -> DisplayAttribute<'a> {
+        DisplayAttribute(self, cp)
+    }
 
-        Ok(AttributeInfo::Any(buf))
+    fn resolve(&mut self, cp: &ConstantPool) -> Result<(), Error> {
+        if let AttributeInfo::Any(ref a) = self.info {
+            let _size = a.len();
+            let mut bytes = Cursor::new(a.clone());
+            let bytes = &mut bytes;
+
+            if let ConstantPoolEntry::Utf8(ref name) = cp[self.name_index] {
+                let info = match name.as_str() {
+                    "ConstantValue" => Ok(AttributeInfo::ConstantValue {
+                        index: CPIndex::deserialize(bytes)?
+                    }),
+                    "Code" => {
+                        let max_stack = read::read_u16(bytes)?;
+                        let max_locals = read::read_u16(bytes)?;
+                        let code_length = read::read_u32(bytes)?;
+                        let code = deserialize_vec(bytes, code_length as usize)?;
+                        let exception_table = Vec::<ExceptionTableEntry>::deserialize(bytes)?;
+                        let mut attributes = Vec::<Attribute>::deserialize(bytes)?;
+
+                        for a in attributes.iter_mut() {
+                            let _ = a.resolve(cp);
+                        }
+
+                        Ok(AttributeInfo::Code {
+                            max_stack,
+                            max_locals,
+                            code,
+                            exception_table,
+                            attributes
+                        })
+                    },
+                    "Exceptions" => Ok(AttributeInfo::Exceptions {
+                        exception_index_table: Vec::<CPIndex>::deserialize(bytes)?,
+                    }),
+                    _ => {
+                        Err(Error::new(ErrorKind::Other, "unkown attribute"))
+                    }
+                };
+                let info = info?;
+                
+                self.info = info;
+                Ok(())
+            } else {
+                Err(Error::new(ErrorKind::Other, "Error when trying to access Attribute name."))
+            }
+        } else {
+            // already resolved
+            Ok(())
+        }
     }
 }
 
@@ -399,9 +516,12 @@ impl Deserialize for Attribute {
     }
 }
 
-impl Display for Attribute {
+
+struct DisplayAttribute<'a>(&'a Attribute, &'a ConstantPool);
+
+impl<'a> Display for DisplayAttribute<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "I'm an Attribute ! Yay")
+        write!(f, "{}: {}", DisplayCP(self.0.name_index, &self.1), self.0.info)
     }
 }
 
@@ -420,22 +540,35 @@ struct JavaClass {
     attributes: Vec<Attribute>,
 }
 
-impl JavaClass {
-    fn deserialize(bytes: Vec<u8>) -> Result<Self, Error> {
-        let mut cursor = Cursor::new(bytes);
+impl Deserialize for JavaClass {
+    fn deserialize(bytes: &mut Cursor<Vec<u8>>) -> Result<Self, Error> {
+        let magic_bytes = read::read_u32(bytes)?;
+        let minor_version = read::read_u16(bytes)?;
+        let major_version = read::read_u16(bytes)?;
+        let constant_pool = ConstantPool::deserialize(bytes)?;
+        let access_flags = AccessFlags::deserialize(bytes)?;
+        let this_class = CPIndex::deserialize(bytes)?;
+        let super_class = CPIndex::deserialize(bytes).ok(); // optional
+        let interfaces = Vec::<CPIndex>::deserialize(bytes)?;
+        let mut fields = Vec::<Field>::deserialize(bytes)?;
+        let mut methods = Vec::<Method>::deserialize(bytes)?;
+        let mut attributes = Vec::<Attribute>::deserialize(bytes)?;
 
-        let magic_bytes = read::read_u32(&mut cursor)?;
-        let minor_version = read::read_u16(&mut cursor)?;
-        let major_version = read::read_u16(&mut cursor)?;
-        let constant_pool = ConstantPool::deserialize(&mut cursor)?;
-        let access_flags = AccessFlags::deserialize(&mut cursor)?;
-        let this_class = CPIndex::deserialize(&mut cursor)?;
-        let super_class = CPIndex::deserialize(&mut cursor).ok(); // optional
-        let interfaces = Vec::<CPIndex>::deserialize(&mut cursor)?;
-        let fields = Vec::<Field>::deserialize(&mut cursor)?;
-        let methods = Vec::<Method>::deserialize(&mut cursor)?;
-        let attributes = Vec::<Attribute>::deserialize(&mut cursor)?;
-
+        // resolve the attributes
+        for f in fields.iter_mut() {
+            for a in f.attributes.iter_mut() {
+                let _ = a.resolve(&constant_pool);
+            }
+        }
+        for m in methods.iter_mut() {
+            for a in m.attributes.iter_mut() {
+                let _ = a.resolve(&constant_pool);
+            }
+        }
+        for a in attributes.iter_mut() {
+            let _ = a.resolve(&constant_pool);
+        }
+    
         Ok(Self {
             magic_bytes,
             minor_version,
@@ -457,7 +590,7 @@ struct DisplayCP<'a>(CPIndex, &'a ConstantPool);
 impl<'a> Display for DisplayCP<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.1.get(&self.0) {
-            Some(v) => write!(f, "{}", DisplayConstantPoolEntry(v, self.1))?,
+            Some(v) => write!(f, "{}", v.display(self.1))?,
             None => write!(f, "(NONE)")?
         };
         //write!(f, "@{}", self.0)
@@ -466,6 +599,11 @@ impl<'a> Display for DisplayCP<'a> {
 }
 
 impl JavaClass {
+    fn from_file<P: AsRef<Path>>(file: P) -> Result<Self, Error> {
+        let bytes = fs::read(file)?;
+        let mut cursor = Cursor::new(bytes);
+        Ok(JavaClass::deserialize(&mut cursor)?)
+    }
     fn print(&self) {
         println!("JavaClass {{");
         println!("--magic_bytes: {:08X}", self.magic_bytes);
@@ -475,13 +613,13 @@ impl JavaClass {
         let mut entries = self.constant_pool.iter().collect::<Vec<(&CPIndex, &ConstantPoolEntry)>>();
         entries.sort_by(|(a, _), (b, _)| a.cmp(&b));
         for (k, v) in entries {
-            println!("      {}: {}", k, DisplayConstantPoolEntry(v, &self.constant_pool));
+            println!("      {}: {}", k, v.display(&self.constant_pool));
         }
         println!("");
         println!("--This Class:");
         println!("    access_flags: {:?}", self.access_flags);
-        println!("    this_class: {}", DisplayCP(self.this_class, &self.constant_pool));
-        println!("    super_class: {}", DisplayCP(self.super_class.unwrap_or(CPIndex(0)), &self.constant_pool));
+        println!("    this_class: {}", self.this_class.display(&self.constant_pool));
+        println!("    super_class: {}", self.super_class.unwrap_or(CPIndex(0)).display(&self.constant_pool));
         println!("");
         println!("--Interfaces:");
         for i in self.interfaces.iter() {
@@ -490,30 +628,29 @@ impl JavaClass {
         println!("");
         println!("--Fields:");
         for i in self.fields.iter() {
-            println!("    {}: {:?} ({})", DisplayCP(i.name_index, &self.constant_pool), i.access_flags, DisplayCP(i.descriptor_index, &self.constant_pool));
+            println!("    {}: {:?} ({})", i.name_index.display(&self.constant_pool), i.access_flags, i.descriptor_index.display(&self.constant_pool));
             for j in i.attributes.iter() {
-                println!("      {}", j);
+                println!("      {}", j.display(&self.constant_pool));
             }
         }
         println!("");
         println!("--Methods:");
         for i in self.methods.iter() {
-            println!("    {}: {:?} ({})", DisplayCP(i.name_index, &self.constant_pool), i.access_flags, DisplayCP(i.descriptor_index, &self.constant_pool));
+            println!("    {}: {:?} ({})", i.name_index.display(&self.constant_pool), i.access_flags, i.descriptor_index.display(&self.constant_pool));
             for j in i.attributes.iter() {
-                println!("    {}", j);
+                println!("      {}", j.display(&self.constant_pool));
             }
         }
         println!("");
         println!("--Attributes:");
         for i in self.attributes.iter() {
-            println!("  {}", i);
+            println!("  {}", i.display(&self.constant_pool));
         }
         println!("}}");
     }
 }
 
 fn main() {
-    let bytes = fs::read("Main.class").unwrap();
-    let class = JavaClass::deserialize(bytes).unwrap();
+    let class = JavaClass::from_file("./Main.class").unwrap();
     class.print();
 }
