@@ -1,12 +1,18 @@
 #![allow(dead_code)]
-use std::{fs, io::{Cursor, Error, ErrorKind}, collections::HashMap, ops::Deref, fmt::Display, path::Path};
+use std::{fs, io::{Cursor, Error, ErrorKind, Write}, collections::HashMap, ops::Deref, fmt::Display, path::Path};
 use bitflags::bitflags;
 use read::read_u8;
+use write::write_u8;
 
 mod read;
+mod write;
 
 trait Deserialize {
     fn deserialize(bytes: &mut Cursor<Vec<u8>>) -> Result<Self, Error> where Self: Sized;
+}
+
+trait Serialize {
+    fn serialize(&self, bytes: &mut Vec<u8>) -> Result<(), Error>;
 }
 
 #[derive(Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
@@ -41,7 +47,13 @@ impl Deserialize for CPIndex {
     }
 }
 
-#[derive(Debug)]
+impl Serialize for CPIndex {
+    fn serialize(&self, bytes: &mut Vec<u8>) -> Result<(), Error> {
+        write::write(bytes, self.0)
+    }
+}
+
+#[derive(Debug, Clone)]
 enum ReferenceKind {
     GetField = 1,
     GetStatic = 2,
@@ -98,6 +110,12 @@ impl Deserialize for ReferenceKind {
     fn deserialize(bytes: &mut Cursor<Vec<u8>>) -> Result<Self, Error> {
         read::read_u8(bytes)?.try_into()
             .map_err(|_| Error::new(ErrorKind::Other, "Error when trying to convert u8 to ReferenceKind"))
+    }
+}
+
+impl Serialize for ReferenceKind {
+    fn serialize(&self, bytes: &mut Vec<u8>) -> Result<(), Error> {
+        write::write::<u8>(bytes, self.clone().into())
     }
 }
 
@@ -207,6 +225,75 @@ impl Deserialize for ConstantPoolEntry {
     }
 }
 
+impl Serialize for ConstantPoolEntry {
+	fn serialize(&self, bytes: &mut Vec<u8>) -> Result<(), Error> {
+		match self {
+		    ConstantPoolEntry::Class { name_index } => {
+			write::write(bytes, 7u8)?;
+			name_index.serialize(bytes)
+		    },
+		    ConstantPoolEntry::FieldRef { class_index, name_and_type_index } => {
+			write::write(bytes, 9u8)?;
+			class_index.serialize(bytes)?;
+			name_and_type_index.serialize(bytes)
+		    },
+		    ConstantPoolEntry::MethodRef { class_index, name_and_type_index } => {
+			write::write(bytes, 10u8)?;
+			class_index.serialize(bytes)?;
+			name_and_type_index.serialize(bytes)
+		    },
+		    ConstantPoolEntry::InterfaceMethodRef { class_index, name_and_type_index } => {
+			write::write(bytes, 11u8)?;
+			class_index.serialize(bytes)?;
+			name_and_type_index.serialize(bytes)
+		    },
+		    ConstantPoolEntry::String { string_index } => {
+			write::write(bytes, 8u8)?;
+			string_index.serialize(bytes)
+		    },
+		    ConstantPoolEntry::Integer(n) => {
+			write::write(bytes, 3u8)?;
+			write::write(bytes, *n)
+		    },
+		    ConstantPoolEntry::Float(n) => {
+			write::write(bytes, 4u8)?;
+			write::write(bytes, *n)
+		    },
+		    ConstantPoolEntry::Long(n) => {
+			write::write(bytes, 5u8)?;
+			write::write(bytes, *n)
+		    },
+		    ConstantPoolEntry::Double(n) => {
+			write::write(bytes, 6u8)?;
+			write::write(bytes, *n)
+		    },
+		    ConstantPoolEntry::NameAndType { name_index, descriptor_index } => {
+			write::write(bytes, 12u8)?;
+			name_index.serialize(bytes)?;
+			descriptor_index.serialize(bytes)
+		    },
+		    ConstantPoolEntry::Utf8(s) => {
+			write::write(bytes, 1u8)?;
+			write::write(bytes, s.as_bytes().to_vec())
+		    },
+		    ConstantPoolEntry::MethodHandle { reference_kind, reference_index } => {
+			write::write(bytes, 15u8)?;
+			reference_kind.serialize(bytes)?;
+			reference_index.serialize(bytes)
+		    },
+		    ConstantPoolEntry::MethodType { descriptor_index } => {
+			write::write(bytes, 16u8)?;
+			descriptor_index.serialize(bytes)
+		    },
+		    ConstantPoolEntry::InvokeDynamic { bootstrap_method_attr_index, name_and_type_index } => {
+			write::write(bytes, 18u8)?;
+			write::write(bytes, *bootstrap_method_attr_index)?;
+			name_and_type_index.serialize(bytes)
+		    },
+		}
+	}
+}
+
 struct DisplayConstantPoolEntry<'a>(&'a ConstantPoolEntry,&'a ConstantPool);
 
 impl<'a> Display for DisplayConstantPoolEntry<'a> {
@@ -279,6 +366,22 @@ impl Deserialize for ConstantPool {
     }
 }
 
+impl Serialize for ConstantPool {
+	fn serialize(&self, bytes: &mut Vec<u8>) -> Result<(), Error> {
+		let count = (self.inner.len() + 1) as u16; // count MUST be len + 1
+		write::write(bytes, count)?;
+
+		let mut entries = self.iter().collect::<Vec<(&CPIndex, &ConstantPoolEntry)>>();
+		entries.sort_by(|(a, _), (b, _)| a.cmp(&b));
+
+		for (_, v) in entries.iter() {
+			v.serialize(bytes)?;
+		}
+		
+		Ok(())
+	}
+}
+
 impl std::ops::Index<CPIndex> for ConstantPool {
     type Output = ConstantPoolEntry;
 
@@ -317,6 +420,12 @@ impl Deserialize for AccessFlags {
     }
 }
 
+impl Serialize for AccessFlags {
+	fn serialize(&self, bytes: &mut Vec<u8>) -> Result<(), Error> {
+		write::write(bytes, self.bits)
+	}
+}
+
 fn deserialize_vec<T: Deserialize>(bytes: &mut Cursor<Vec<u8>>, count: usize) -> Result<Vec<T>, Error> {
     let mut res = Vec::with_capacity(count);
 
@@ -330,6 +439,16 @@ impl<T> Deserialize for Vec<T> where T: Deserialize {
     fn deserialize(bytes: &mut Cursor<Vec<u8>>) -> Result<Self, Error> {
         let count = read::read_u16(bytes)? as usize;
         deserialize_vec(bytes, count)
+    }
+}
+
+impl<T> Serialize for Vec<T> where T: Serialize {
+    fn serialize(&self, bytes: &mut Vec<u8>) -> Result<(), Error> {
+    	write::write(bytes, self.len() as u16)?;
+	for i in self.iter() {
+		i.serialize(bytes)?;
+	}
+	Ok(())
     }
 }
 
@@ -357,6 +476,15 @@ impl Deserialize for Field {
     }
 }
 
+impl Serialize for Field {
+	fn serialize(&self, bytes: &mut Vec<u8>) -> Result<(), Error> {
+		self.access_flags.serialize(bytes)?;
+		self.name_index.serialize(bytes)?;
+		self.descriptor_index.serialize(bytes)?;
+		self.attributes.serialize(bytes)
+	}
+}
+
 #[derive(Debug)]
 struct Method {
     access_flags: AccessFlags,
@@ -381,6 +509,15 @@ impl Deserialize for Method {
     }
 }
 
+impl Serialize for Method {
+	fn serialize(&self, bytes: &mut Vec<u8>) -> Result<(), Error> {
+		self.access_flags.serialize(bytes)?;
+		self.name_index.serialize(bytes)?;
+		self.descriptor_index.serialize(bytes)?;
+		self.attributes.serialize(bytes)
+	}
+}
+
 #[derive(Debug)]
 struct ExceptionTableEntry {
     start: u16,
@@ -400,12 +537,27 @@ impl Deserialize for ExceptionTableEntry {
     }
 }
 
+impl Serialize for ExceptionTableEntry {
+	fn serialize(&self, bytes: &mut Vec<u8>) -> Result<(), Error> {
+		write::write(bytes, self.start)?;
+		write::write(bytes, self.end)?;
+		write::write(bytes, self.handler)?;
+		self.catch_type.serialize(bytes)
+	}
+}
+
 #[derive(Debug)]
 struct CodeByte(u8);
 
 impl Deserialize for CodeByte {
     fn deserialize(bytes: &mut Cursor<Vec<u8>>) -> Result<Self, Error> {
         Ok(Self(read::read_u8(bytes)?))
+    }
+}
+
+impl Serialize for CodeByte {
+    fn serialize(&self, bytes: &mut Vec<u8>) -> Result<(), Error> {
+    	write::write(bytes, self.0)
     }
 }
 
@@ -434,6 +586,26 @@ impl Deserialize for AttributeInfo {
         let buf = read::read_bytes(bytes, size as usize)?;
         Ok(AttributeInfo::Any(buf))
     }
+}
+
+impl Serialize for AttributeInfo {
+	fn serialize(&self, bytes: &mut Vec<u8>) -> Result<(), Error> {
+		match self {
+			AttributeInfo::Any(b) => write::write(bytes, b.clone()),
+			AttributeInfo::Code { max_stack, max_locals, code, exception_table, attributes } => {
+				write::write(bytes, *max_stack)?;
+				write::write(bytes, *max_locals)?;
+				write::write(bytes, code.len() as u32)?;
+				for i in code.iter() {
+					i.serialize(bytes)?;
+				}
+				exception_table.serialize(bytes)?;
+				attributes.serialize(bytes)
+			},
+			AttributeInfo::Exceptions { exception_index_table } => exception_index_table.serialize(bytes),
+			AttributeInfo::ConstantValue { index } => index.serialize(bytes)
+		}
+	}
 }
 
 impl Display for AttributeInfo {
@@ -516,6 +688,15 @@ impl Deserialize for Attribute {
     }
 }
 
+impl Serialize for Attribute {
+	fn serialize(&self, bytes: &mut Vec<u8>) -> Result<(), Error> {
+		self.name_index.serialize(bytes)?;
+		let mut buf = Vec::new();
+		self.info.serialize(&mut buf)?;
+		write::write(bytes, buf.len() as u32)?;
+		write::write(bytes, buf)
+	}
+}
 
 struct DisplayAttribute<'a>(&'a Attribute, &'a ConstantPool);
 
@@ -585,6 +766,22 @@ impl Deserialize for JavaClass {
     }
 }
 
+impl Serialize for JavaClass {
+	fn serialize(&self, bytes: &mut Vec<u8>) -> Result<(), Error> {
+		write::write(bytes, self.magic_bytes)?;
+		write::write(bytes, self.minor_version)?;
+		write::write(bytes, self.major_version)?;
+		self.constant_pool.serialize(bytes)?;
+		self.access_flags.serialize(bytes)?;
+		self.this_class.serialize(bytes)?;
+		self.super_class.unwrap_or(CPIndex(0)).serialize(bytes)?;
+		self.interfaces.serialize(bytes)?;
+		self.fields.serialize(bytes)?;
+		self.methods.serialize(bytes)?;
+		self.attributes.serialize(bytes)
+	}
+}
+
 struct DisplayCP<'a>(CPIndex, &'a ConstantPool);
 
 impl<'a> Display for DisplayCP<'a> {
@@ -603,6 +800,11 @@ impl JavaClass {
         let bytes = fs::read(file)?;
         let mut cursor = Cursor::new(bytes);
         Ok(JavaClass::deserialize(&mut cursor)?)
+    }
+    fn to_file<P: AsRef<Path>>(&self, file: P) -> Result<(), Error> {
+	    let mut buf = Vec::new();
+	    self.serialize(&mut buf)?;
+	    fs::write(file, buf)
     }
     fn print(&self) {
         println!("JavaClass {{");
@@ -653,4 +855,5 @@ impl JavaClass {
 fn main() {
     let class = JavaClass::from_file("./Main.class").unwrap();
     class.print();
+    class.to_file("./NMain.class").unwrap();
 }
